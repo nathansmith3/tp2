@@ -1,0 +1,2056 @@
+//*****************************************************************************
+//
+// Digiscope Tiva Launchpad Code
+// Team 30: Nathan Smith
+//
+// This code was developed as part of a course at the University of Queensland
+//
+//*****************************************************************************
+
+
+//Includes
+#include <math.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "inc/hw_memmap.h"
+#include "inc/hw_types.h"
+#include "driverlib/gpio.h"
+#include "drivers/pinout.h"
+#include "drivers/buttons.h"
+#include "driverlib/pin_map.h"
+#include "driverlib/rom.h"
+#include "driverlib/rom_map.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/uart.h"
+#include "utils/words.h"
+#include "utils/sine.h"
+#include "utils/uartstdio.h"
+#include "inc/hw_ints.h"
+#include "driverlib/timer.h"
+#include "driverlib/interrupt.h"
+
+
+
+
+
+// DEFINES
+#define HOME 1
+#define TRIG 2
+#define COUPLE 3
+#define INFO 4
+#define WAVEGEN 5
+#define STANDBY 6
+
+#define GET_X 0xD0
+#define GET_Y 0x90
+
+#define NOISE 0
+#define SQUARE 1
+#define RAMP 2
+#define TRIANGLE 3
+#define SINE 4
+#define OFF 5
+
+#define RANDOM_MAX 0xFF
+
+
+
+//Global Variables
+//System Variables
+uint32_t g_ui32SysClock;
+uint32_t g_ui32Flags;
+int PCconnection;
+
+//Variable Packet
+uint32_t VariablesPack1;
+uint32_t VariablesPack2;
+uint32_t VariablesPack3;
+
+
+//LCD Variables
+uint8_t LCDbrightness;
+uint8_t LCDwindow;
+uint8_t LCDtempWindow;
+uint8_t PWM_count;
+
+//Function Generator Variable
+uint8_t FGwavetype;
+uint32_t FGfrequency;
+uint8_t FGarrayOfValues[512];
+uint16_t FGcount;
+uint16_t FGoffset;
+uint8_t FGamp;
+
+//Front End Variables
+uint8_t FEvariables;
+uint8_t FEvertRangeA;
+uint8_t FEvertRangeB;
+uint8_t FEhorRange;
+uint16_t FEoffsetA;
+uint16_t FEoffsetB;
+uint8_t FEcoupleA;
+uint8_t FEcoupleB;
+
+//Signal Aquisition Variables
+uint8_t SAmode;
+uint16_t SAthreshold;
+uint8_t SAtype;
+uint8_t SAstate;
+
+
+// The error routine that is called if the driver library enFGcounters an error.
+#ifdef DEBUG
+void
+__error__(char *pcFilename, uint32_t ui32Line)
+{
+}
+#endif
+
+
+
+
+/*
+ *
+ * Handler for interrupt triggered by Timer0. Changes the output to the wave generator
+ *
+ */
+void Timer0IntHandler(void) {
+
+	int randomNumber;
+	PWM_count++;
+
+	// Clear the timer interrupt.
+    ROM_TimerIntClear(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
+
+	//
+	// Check if period complete
+	//
+	if(FGcount > 511) {
+		FGcount = 0;
+	}
+
+	if(FGwavetype != OFF) {
+
+		if(FGwavetype == NOISE) {
+
+			randomNumber = (rand() % RANDOM_MAX);
+
+			//bit 0-5
+			ROM_GPIOPinWrite(GPIO_PORTL_BASE, 0x3F, (randomNumber) & 0x3F);
+			//bit 6,7
+			ROM_GPIOPinWrite(GPIO_PORTE_BASE, 0x03, (randomNumber & 0xC0)>>6);
+
+		} else {
+
+			//bit 0-5
+			ROM_GPIOPinWrite(GPIO_PORTL_BASE, 0x3F, ((FGarrayOfValues[FGcount]) & 0x3F));
+			//bit 6,7
+			ROM_GPIOPinWrite(GPIO_PORTE_BASE, 0x03, (FGarrayOfValues[FGcount] & 0xC0)>>6);
+		}
+		// WAVE nCS LOW
+		ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_2,0);
+		// WAVE nWR LOW
+		ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3,0);
+
+
+		// WAVE nWR HIGH
+		ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3 ,0xFF);
+
+		// WAVE nCS HIGH
+		ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_2, 0xFF);
+	}
+
+	if(FGfrequency < 250) {
+		FGcount = FGcount + 1;
+	} else if(FGfrequency < 500) {
+		FGcount = FGcount + 2;
+	} else if(FGfrequency < 1000) {
+		FGcount = FGcount + 4;
+	} else if(FGfrequency < 2000) {
+		FGcount = FGcount + 8;
+	} else if(FGfrequency < 4000) {
+		FGcount = FGcount + 16;
+	} else {
+		FGcount = FGcount + 25;
+	}
+/*
+	if(PWM_count % LCDbrightness) {
+		ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_1, 0xFF);
+	} else {
+		ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_1, 0);
+	}*/
+
+}
+
+
+/*
+ *
+ * Function that sets the frequncy of the Function Generator
+ * @param:		freq = the desired frequency of the Function Generator
+ *
+ */
+void FG_Set_Frequency(int freq) {
+
+	uint32_t FGinterruptsPerSecond;
+	FGfrequency = freq;
+	UARTprintf("FREQ: %d\n\r", freq);
+
+	if(FGfrequency < 250) {
+		FGinterruptsPerSecond = FGfrequency * 512;
+	} else if(FGfrequency < 500) {
+		FGinterruptsPerSecond = FGfrequency * 256;
+	} else if(FGfrequency < 1000) {
+		FGinterruptsPerSecond = FGfrequency * 128;
+	} else if(FGfrequency < 2000) {
+		FGinterruptsPerSecond = FGfrequency * 64;
+	} else if(FGfrequency < 4000) {
+		FGinterruptsPerSecond = FGfrequency * 32;
+	} else {
+		FGinterruptsPerSecond = FGfrequency * 20;
+	}
+
+    ROM_TimerLoadSet(TIMER0_BASE, TIMER_A, (g_ui32SysClock/FGinterruptsPerSecond));
+
+}
+
+/*
+ *
+ * Function that sets the DC offset of the Function Generator
+ * @param:		offset = signed value of to be written to the DAC
+ *
+ */
+void FG_Set_Offset(int offset) {
+
+	int temp = offset;
+
+	// Check if negative
+	if(temp < 0){
+		// Assign inverting relay
+
+		// Reassign number to positive value
+		temp = temp * (-1);
+	} else {
+		//de-assign inverting relay
+	}
+
+	// Disable function gen interrupt to avoid wrong DAC write
+    ROM_IntDisable(INT_TIMER0A);
+
+	//bit 0-5
+	ROM_GPIOPinWrite(GPIO_PORTL_BASE, 0x3F, (temp & 0x3F));
+	//bit 6,7
+	ROM_GPIOPinWrite(GPIO_PORTE_BASE, 0x03, (temp & 0xC0)>>6);
+	//bit 8,9
+	ROM_GPIOPinWrite(GPIO_PORTE_BASE, 0x03, (temp & 0x300)>>4);
+
+
+	// WAVE nCS2 LOW
+	ROM_GPIOPinWrite(GPIO_PORTC_BASE, GPIO_PIN_7,0);
+	// WAVE nWR LOW
+	ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3,0);
+
+
+	// WAVE nWR HIGH
+	ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3 ,0xFF);
+
+	// WAVE nCS2 HIGH
+	ROM_GPIOPinWrite(GPIO_PORTC_BASE, GPIO_PIN_7, 0xFF);
+
+	//Enable function gen interrupt again
+    ROM_IntEnable(INT_TIMER0A);
+
+}
+
+/*
+ *
+ * Function that fills array of values for the wave generator to loop through
+ * @param:  wave = Wave that is required from the wavegen
+ *
+ */
+void FG_Fill_Values(int wave) {
+	int i = 0;
+
+	UARTprintf("WAVE: %d\n\r", wave);
+
+	switch(wave) {
+
+	case SQUARE:
+
+		for(i=0; i < 512; i++) {
+			if( i < 256) {
+				FGarrayOfValues[i] = 0x00;
+			} else {
+				FGarrayOfValues[i] = 0xFF;
+			}
+		}
+		break;
+
+	case RAMP:
+
+		for(i=0; i < 512; i++) {
+			FGarrayOfValues[i] = i/2;
+		}
+		break;
+
+	case TRIANGLE:
+
+		for(i=0; i < 512; i++) {
+			if( i <= 255) {
+				FGarrayOfValues[i] = i;
+			} else {
+				FGarrayOfValues[i] = (512-i);
+			}
+		}
+		break;
+
+	case SINE:
+		for(i=0; i < 512; i++) {
+			FGarrayOfValues[i] = SINEWAVE[i];
+		}
+
+	break;
+
+	case OFF:
+		for(i=0; i < 512; i++) {
+			FGarrayOfValues[i] = 0x0F;
+		}
+	break;
+	}
+}
+
+/*
+ *
+ * Function that assigns the multiplexer to have the path neccesary for specified gain of the function generator
+ *
+ */
+void FG_Set_Amp(int amp) {
+
+	// Set S0,S1,S2 according to desired  peak - peak
+	switch(amp) {
+
+		case 0:	//100mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 1:	//200mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 2:	//500mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 3:	//1V
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 4:	//2V
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0xFF);	//S2
+			break;
+
+		default:
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+	}
+
+	// Cycle en3
+	ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_1, 0);
+	ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_1, 0xFF);
+}
+
+
+
+/*
+ *
+ * Function that assigns the relays on the front end.
+ * These relays control the DC coupling, and BandPass Filter.
+ *
+ */
+void FE_Set_Coupling(uint8_t A, uint8_t B) {
+
+	if(A) {
+		ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_5, 0xFF);
+	} else {
+		ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_5, 0);
+	}
+
+	if(B) {
+		ROM_GPIOPinWrite(GPIO_PORTQ_BASE, GPIO_PIN_0, 0xFF);
+	} else {
+		ROM_GPIOPinWrite(GPIO_PORTQ_BASE, GPIO_PIN_0, 0);
+	}
+
+
+}
+
+
+/*
+ *
+ * Function that assigns the multiplexer to have the path neccesary for specified gain
+ * given the vertical range for channel A
+ *
+ */
+void FE_Set_Amp_A(int range){
+
+	// Set S0,S1,S2 according to desired  peak - peak
+	switch(range) {
+
+		case 0:	//20mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 1:	//50mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 2:	//100mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 3:	//200mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 4:	//500mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0xFF);	//S2
+			break;
+
+		case 5:	//1V
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0xFF);	//S2
+			break;
+
+		case 6:	//2V
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0xFF);	//S2
+			break;
+
+		case 7:	//5V
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0xFF);	//S2
+			break;
+
+		default:
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+	}
+
+	// Cycle en1
+	ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_0, 0);
+	ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_0, 0xFF);
+
+}
+
+
+/*
+ *
+ * Function that assigns the multiplexer to have the path neccesary for specified
+ * gain given the vertical range for channel B
+ *
+ */
+void FE_Set_Amp_B(int range){
+
+	// Set S0,S1,S2 according to desired  peak - peak
+	switch(range) {
+
+		case 0:	//20mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 1:	//50mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 2:	//100mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 3:	//200mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+		case 4:	//500mV
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0xFF);	//S2
+			break;
+
+		case 5:	//1V
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0xFF);	//S2
+			break;
+
+		case 6:	//2V
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0xFF);	//S2
+			break;
+
+		case 7:	//5V
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0xFF);	//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0xFF);	//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0xFF);	//S2
+			break;
+
+		default:
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, 0);		//S0
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_0, 0);		//S1
+			ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_1, 0);		//S2
+			break;
+
+	}
+
+	// Cycle en2
+	ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_4, 0);
+	ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_4, 0xFF);
+}
+
+
+/*
+ *
+ * Function that sets the DC offset at input of channel A
+ *
+ */
+void FE_Set_Offset_A(int offset) {
+
+	int temp = offset;
+
+	// Disable function gen interrupt to avoid wrond DAC write
+    ROM_IntDisable(INT_TIMER0A);
+
+	//bit 0-5
+	ROM_GPIOPinWrite(GPIO_PORTL_BASE, 0x3F, (temp & 0x3F));
+	//bit 6,7
+	ROM_GPIOPinWrite(GPIO_PORTE_BASE, 0x03, (temp & 0xC0)>>6);
+	//bit 8,9
+	ROM_GPIOPinWrite(GPIO_PORTE_BASE, 0x03, (temp & 0x300)>>4);
+
+
+	// WAVE nCS2 LOW
+	ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_7,0);
+	// WAVE nWR LOW
+	ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3,0);
+
+
+	// WAVE nWR HIGH
+	ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3 ,0xFF);
+
+	// WAVE nCS2 HIGH
+	ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_7, 0xFF);
+
+	// Enable Function Gen interrupt again
+    ROM_IntEnable(INT_TIMER0A);
+}
+
+/*
+ *
+ * Function that sets the DC offset at input of channel B
+ *
+ */
+void FE_Set_Offset_B(int offset) {
+
+	int temp = offset;
+
+	// Disable function gen interrupt to avoid wrong DAC write
+    ROM_IntDisable(INT_TIMER0A);
+
+
+	//bit 0-5
+	ROM_GPIOPinWrite(GPIO_PORTL_BASE, 0x3F, (temp & 0x3F));
+	//bit 6,7
+	ROM_GPIOPinWrite(GPIO_PORTE_BASE, 0x03, (temp & 0xC0)>>6);
+	//bit 8,9
+	ROM_GPIOPinWrite(GPIO_PORTE_BASE, 0x03, (temp & 0x300)>>4);
+
+
+	// WAVE nCS2 LOW
+	ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6,0);
+	// WAVE nWR LOW
+	ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3,0);
+
+
+	// WAVE nWR HIGH
+	ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3 ,0xFF);
+
+	// WAVE nCS2 HIGH
+	ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, 0xFF);
+
+	// Enable function gen interrupt again
+    ROM_IntEnable(INT_TIMER0A);
+
+}
+
+
+/*
+ *
+ * Function that writes a command to the LCD
+ * @param: 	bb = command to be written to LCD
+ *
+ */
+void LCD_Write_Command(uint16_t bb) {
+
+	//Write RS low
+	ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_2, 0);
+
+	//Write Databits(0-15)
+	ROM_GPIOPinWrite(GPIO_PORTM_BASE, 0xFF, (bb & 0x00FF));	//bit0-7
+	ROM_GPIOPinWrite(GPIO_PORTK_BASE, 0xFF, (bb & 0xFF00)>>8);	//bit8-15
+
+	//Write CS low
+	ROM_GPIOPinWrite(GPIO_PORTH_BASE, GPIO_PIN_3, 0);
+
+	//Cycle WR
+	ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, 0);
+	ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, 0xFF);
+
+
+	//Write CS high
+	ROM_GPIOPinWrite(GPIO_PORTH_BASE, GPIO_PIN_3, 0xFF);
+
+}
+
+/*
+ * Function that writes data to the LCD
+ * @param: 	bb = data to be written to LCD
+ *
+ */
+void LCD_Write_Data(uint16_t bb) {
+
+
+	//Write RS HIGH
+	ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_2, 0xFF);
+
+	//Write Databits(0-15)
+	ROM_GPIOPinWrite(GPIO_PORTM_BASE, 0xFF, (bb & 0x00FF));	//bit0-7
+	ROM_GPIOPinWrite(GPIO_PORTK_BASE, 0xFF, (bb & 0xFF00)>>8);	//bit8-15
+
+	//Write CS low
+	ROM_GPIOPinWrite(GPIO_PORTH_BASE, GPIO_PIN_3, 0);
+
+	//Cycle WR
+	ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, 0);
+	ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, 0xFF);
+
+
+	//Write CS high
+	ROM_GPIOPinWrite(GPIO_PORTH_BASE, GPIO_PIN_3, 0xFF);
+
+}
+
+/*
+ * Function that writes a command and then data to the LCD
+ * @param: 	cmd = command to be written to LCD
+ * 			data = data to be written to LCD
+ *
+ */
+void LCD_Write_Command_Data(uint16_t cmd, uint16_t data) {
+	LCD_Write_Command(cmd);
+	LCD_Write_Data(data);
+}
+
+/*
+ * Function that sets the starting position and the end position for the LCD
+ * 		that is going to drawn on.
+ * @param: 	x0 = starting X position
+ * 			y0  = starting Y position
+ * 			x1  = ending X position
+ * 			x2  = ending Y position
+ *
+ */
+void LCD_Set_Draw_Range(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+	LCD_Write_Command_Data(0x0044, (x1<<8) + x0);
+	LCD_Write_Command_Data(0x0045, y0);
+	LCD_Write_Command_Data(0x0046, y1);
+	LCD_Write_Command_Data(0x004e, x0);
+	LCD_Write_Command_Data(0x004f, y0);
+	LCD_Write_Command (0x0022);
+}
+
+/*
+ * Function that assigns the setting of the LCD upon startup,
+ *
+ */
+void LCD_Init(void) {
+
+	// reset LCD
+	ROM_GPIOPinWrite(GPIO_PORTH_BASE, GPIO_PIN_2, 0xFF);
+	SysCtlDelay(g_ui32SysClock / 16 / 3);
+	ROM_GPIOPinWrite(GPIO_PORTH_BASE, GPIO_PIN_2, 0);
+	SysCtlDelay(g_ui32SysClock / 16 / 3);
+	ROM_GPIOPinWrite(GPIO_PORTH_BASE, GPIO_PIN_2, 0xFF);
+
+
+	//cs, nWR, RD
+	ROM_GPIOPinWrite(GPIO_PORTH_BASE, GPIO_PIN_3, 0xFF);
+	ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_0, 0xFF);
+	ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, 0xFF);
+
+	SysCtlDelay(g_ui32SysClock / 16 / 3);
+
+	// oscilator start
+	LCD_Write_Command_Data(0x0000,0x0001);
+	// power control
+	LCD_Write_Command_Data(0x0003,0xA8A4);
+	LCD_Write_Command_Data(0x000C,0x0000);
+	LCD_Write_Command_Data(0x000D,0x080C);
+	LCD_Write_Command_Data(0x000E,0x2B00);
+	LCD_Write_Command_Data(0x001E,0x00B7);
+	//driver output control
+	LCD_Write_Command_Data(0x0001,0x2B3F);
+	// LCD drive AC control
+	LCD_Write_Command_Data(0x0002,0x0600);
+	//sleep mode
+	LCD_Write_Command_Data(0x0010,0x0000);
+	// entry mode
+	LCD_Write_Command_Data(0x0011,0x6070);
+	//compare registers
+	LCD_Write_Command_Data(0x0005,0x0000);
+	LCD_Write_Command_Data(0x0006,0x0000);
+	//horizontal porch
+	LCD_Write_Command_Data(0x0016,0xEF1C);
+	//vertical porch
+	LCD_Write_Command_Data(0x0017,0x0003);
+	//display control
+	LCD_Write_Command_Data(0x0007,0x0233);
+	//lots of 0s
+	LCD_Write_Command_Data(0x000B,0x0000);
+	LCD_Write_Command_Data(0x000F,0x0000);
+	LCD_Write_Command_Data(0x0041,0x0000);
+	LCD_Write_Command_Data(0x0042,0x0000);
+	LCD_Write_Command_Data(0x0048,0x0000);
+	//first window end
+	LCD_Write_Command_Data(0x0049,0x013F);
+	LCD_Write_Command_Data(0x004A,0x0000);
+	LCD_Write_Command_Data(0x004B,0x0000);
+	//horizontal RAM address
+	LCD_Write_Command_Data(0x0044,0xEF00);
+	//vertical RAM start
+	LCD_Write_Command_Data(0x0045,0x0000);
+	//vertical RAM end
+	LCD_Write_Command_Data(0x0046,0x013F);
+	// GAMMA controls
+	LCD_Write_Command_Data(0x0030,0x0707);
+	LCD_Write_Command_Data(0x0031,0x0204);
+	LCD_Write_Command_Data(0x0032,0x0204);
+	LCD_Write_Command_Data(0x0033,0x0502);
+	LCD_Write_Command_Data(0x0034,0x0507);
+	LCD_Write_Command_Data(0x0035,0x0204);
+	LCD_Write_Command_Data(0x0036,0x0204);
+	LCD_Write_Command_Data(0x0037,0x0502);
+	LCD_Write_Command_Data(0x003A,0x0302);
+	LCD_Write_Command_Data(0x003B,0x0302);
+	// RAM write data
+	LCD_Write_Command_Data(0x0023,0x0000);
+	LCD_Write_Command_Data(0x0024,0x0000);
+	// ????
+	LCD_Write_Command_Data(0x0025,0x8000);
+	// Set X address FGcounter
+	LCD_Write_Command_Data(0x004f,0x0000);
+	//Set Y address FGcounter
+	LCD_Write_Command_Data(0x004e,0x0000);
+	// RAM data w/r
+	LCD_Write_Command(0x0022);
+}
+
+
+/*
+ * Function that draws words given a position on the LCD
+ * @param: 	pos_x = starting X position
+ * 			pos_y  = starting Y position
+ * 			len  = length of bitmap
+ * 			letters  = bitmap of letters for word
+ * 			fontColour = font colour
+ * 			backColour = colour of background
+ *
+ */
+void LCD_Draw_Word(int pos_x, int pos_y, int len, uint8_t letters[], uint16_t fontColour, uint16_t backColour) {
+
+	int k;
+	int j;
+
+	LCD_Set_Draw_Range(pos_x, pos_y, pos_x + 7, pos_y + len);
+	for(k=0; k<len; k++) {
+		for(j=0; j<8; j++) {
+			if(1<<j & letters[k]) {
+				LCD_Write_Data(fontColour);
+			} else {
+				LCD_Write_Data(backColour);
+			}
+		}
+	}
+}
+
+/*
+ * Function that draws the toolbar of the LCD
+ *
+ */
+void LCD_Draw_Toolbar(void) {
+
+	int i;
+	int j;
+
+	// Draw Bar
+	LCD_Set_Draw_Range(0,0,60,319);
+	for(i=0; i<320 ;i++) {
+		for(j=0; j<59 ;j++) {
+			if(i == 75 || i == 76 || i == 254 || i == 255) {
+				LCD_Write_Data(0x0000);
+			}
+			else {
+				LCD_Write_Data(0x001F);
+			}
+		}
+		LCD_Write_Data(0x0000);
+		LCD_Write_Data(0x0000);
+	}
+
+	// Draw home sign
+	LCD_Draw_Word(30,276,23,w_HOME, 0xFFFF,0x001F);
+
+	// Draw standby sign
+	LCD_Draw_Word(30,17,41,w_STANDBY, 0xFFFF, 0x001F);
+
+	// Draw brightness scale
+	LCD_Set_Draw_Range(25,100,35,230);
+
+	for(i=25; i<36; i++) {
+		for(j=100; j<231; j++) {
+			LCD_Write_Data(0xFFFF);
+		}
+	}
+
+	LCD_Set_Draw_Range(20,94,40,104);
+
+	for(i=20; i<=40; i++) {
+		for(j=100; j<=110; j++) {
+			LCD_Write_Data(0xFFFF);
+		}
+	}
+
+	LCD_Set_Draw_Range(20,127,40,137);
+
+	for(i=20; i<=40; i++) {
+		for(j=100; j<=110; j++) {
+			LCD_Write_Data(0xFFFF);
+		}
+	}
+
+	LCD_Set_Draw_Range(20,160,40,170);
+
+	for(i=20; i<=40; i++) {
+		for(j=100; j<=110; j++) {
+			LCD_Write_Data(0xFFFF);
+		}
+	}
+
+	LCD_Set_Draw_Range(20,193,40,203);
+
+	for(i=20; i<=40; i++) {
+		for(j=100; j<=110; j++) {
+			LCD_Write_Data(0xFFFF);
+		}
+	}
+
+	LCD_Set_Draw_Range(20,226,40,236);
+
+	for(i=20; i<=40; i++) {
+		for(j=100; j<=110; j++) {
+			LCD_Write_Data(0xFFFF);
+		}
+	}
+
+	// draw knob
+	switch(LCDbrightness) {
+
+		case 5:
+			LCD_Set_Draw_Range(18,92,42,106);
+
+			for(i=18; i<=42; i++) {
+				for(j=92; j<=106; j++) {
+					LCD_Write_Data(0x0000);
+				}
+			}
+			break;
+		case 4:
+			LCD_Set_Draw_Range(18,125,42,139);
+
+			for(i=18; i<=42; i++) {
+				for(j=92; j<=106; j++) {
+					LCD_Write_Data(0x0000);
+				}
+			}
+			break;
+		case 3:
+			LCD_Set_Draw_Range(18,158,42,173);
+
+			for(i=18; i<=42; i++) {
+				for(j=92; j<=106; j++) {
+					LCD_Write_Data(0x0000);
+				}
+			}
+			break;
+		case 2:
+			LCD_Set_Draw_Range(18,191,42,215);
+
+			for(i=18; i<=42; i++) {
+				for(j=92; j<=106; j++) {
+					LCD_Write_Data(0x0000);
+				}
+			}
+			break;
+
+		case 1:
+			LCD_Set_Draw_Range(18,224,42,238);
+
+			for(i=18; i<=42; i++) {
+				for(j=92; j<=106; j++) {
+					LCD_Write_Data(0x0000);
+				}
+			}
+			break;
+	}
+}
+/*
+ * Function that clears the entire LCD by drawing it White
+ *
+ */
+void LCD_Clear(void) {
+    int i,j;
+
+	LCD_Set_Draw_Range(0,0,239,319);
+
+    for(i=0;i<320;i++)
+	{
+	    for(j=0;j<240;j++)
+		{
+          	LCD_Write_Data(0xFFFF);
+		}
+	}
+}
+
+/*
+ * Function that draws the background of the LCD a given colour
+ * @param: 	colour = colour of background
+ *
+ */
+void LCD_Background(uint16_t colour) {
+    int i,j;
+
+	LCD_Set_Draw_Range(61,0,239,319);
+
+    for(i=0;i<320;i++)
+	{
+	    for(j=0;j<179;j++)
+		{
+          	LCD_Write_Data(colour);
+		}
+	}
+}
+
+/*
+ * Function that draws the Wavegen control window
+ *
+ */
+void LCD_Draw_Wavegen_Screen(void) {
+
+	int i,j;
+
+	LCD_Background(0xFFFF);
+
+	LCD_Set_Draw_Range(60,235,239,236);
+
+	for(i=235; i<=236; i++) {
+		for(j=60; j<=239; j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(79,19,8,w_plus,0x0000,0xFFFF);
+	LCD_Draw_Word(79,208,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(79,106,23,w_FREQ,0x0000,0xFFFF);
+
+	LCD_Set_Draw_Range(105,0,106,235);
+
+	for(i=0; i<=235; i++) {
+		for(j=105; j<=106; j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(124,19,8,w_plus,0x0000,0xFFFF);
+	LCD_Draw_Word(124,208,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(124,112,17,w_AMP,0x0000,0xFFFF);
+
+	LCD_Set_Draw_Range(150,0,151,235);
+
+	for(i=0; i<=235; i++) {
+		for(j=105; j<=106; j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(169,19,8,w_plus,0x0000,0xFFFF);
+	LCD_Draw_Word(169,208,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(169,106,23,w_WAVE,0x0000,0xFFFF);
+
+	LCD_Set_Draw_Range(195,0,196,235);
+
+	for(i=0; i<=235; i++) {
+		for(j=105; j<=106; j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(214,19,8,w_plus,0x0000,0xFFFF);
+	LCD_Draw_Word(214,208,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(214,103,35,w_OFFSET,0x0000,0xFFFF);
+
+	LCD_Draw_Word(142,257,41,w_WAVEGEN,0x0000,0xFFFF);
+	LCD_Draw_Word(151,257,35,w_ON_OFF,0x0000,0xFFFF);
+
+}
+
+/*
+ * Function that draws the coupling and range control window
+ *
+ */
+void LCD_Draw_Couple_Screen(void) {
+
+	int i,j;
+
+	LCD_Background(0xFFFF);
+
+	// Draw cross button A
+	LCD_Set_Draw_Range(92,220,182,260);
+
+	for(i=92; i<=182; i++) {
+		for(j=220; j<=260; j++) {
+			LCD_Write_Data(0x07E0);
+		}
+	}
+
+	LCD_Set_Draw_Range(122,180,152,300);
+
+	for(i=122; i<=152; i++) {
+		for(j=180; j<=300; j++) {
+			LCD_Write_Data(0x07E0);
+		}
+	}
+
+	LCD_Draw_Word(103,236,8,w_plus,0x0000,0x07E0);
+	LCD_Draw_Word(133,196,8,w_plus,0x0000,0x07E0);
+	LCD_Draw_Word(163,236,8,w_minus,0x0000,0x07E0);
+	LCD_Draw_Word(133,276,8,w_minus,0x0000,0x07E0);
+	LCD_Draw_Word(133,225,29,w_RANGE,0x0000,0x07E0);
+
+	// Draw cross button B
+	LCD_Set_Draw_Range(92,60,182,100);
+
+	for(i=92; i<=182; i++) {
+		for(j=220; j<=260; j++) {
+			LCD_Write_Data(0xFFE0);
+		}
+	}
+
+	LCD_Set_Draw_Range(122,20,152,140);
+
+	for(i=122; i<=152; i++) {
+		for(j=180; j<=300; j++) {
+			LCD_Write_Data(0xFFE0);
+		}
+	}
+
+	LCD_Draw_Word(103,76,8,w_plus,0x0000,0xFFE0);
+	LCD_Draw_Word(133,36,8,w_plus,0x0000,0xFFE0);
+	LCD_Draw_Word(163,76,8,w_minus,0x0000,0xFFE0);
+	LCD_Draw_Word(133,116,8,w_minus,0x0000,0xFFE0);
+	LCD_Draw_Word(133,65,29,w_RANGE,0x0000,0xFFE0);
+
+
+	LCD_Set_Draw_Range(60,159,239,160);
+
+	for(i=0; i<180 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(65,60,5,w_B,0xF100,0xFFFF);
+	LCD_Draw_Word(65,220,5,w_A,0xF100,0xFFFF);
+	LCD_Draw_Word(65,70,41,w_CHANNEL, 0xF100,0xFFFF);
+	LCD_Draw_Word(65,230,41,w_CHANNEL, 0xF100,0xFFFF);
+
+
+	LCD_Set_Draw_Range(75,0,76,319);
+
+	for(i=0; i<320 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Set_Draw_Range(198,0,199,319);
+
+	for(i=0; i<320 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(214,70,35,w_COUPLE,0x0000, 0xFFFF);
+	LCD_Draw_Word(214,230,35,w_COUPLE,0x0000, 0xFFFF);
+	LCD_Draw_Word(214,60,5,w_B,0x0000,0xFFFF);
+	LCD_Draw_Word(214,220,5,w_A,0x0000,0xFFFF);
+
+
+
+}
+
+/*
+ * Function that draws the Triggering Control window
+ *
+ */
+void LCD_Draw_Trig_Screen(void) {
+
+	int i,j;
+
+	LCD_Background(0xFFFF);
+
+	LCD_Set_Draw_Range(60,159,239,160);
+
+	for(i=0; i<180 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(65,60,5,w_B,0xF100,0xFFFF);
+	LCD_Draw_Word(65,220,5,w_A,0xF100,0xFFFF);
+	LCD_Draw_Word(65,70,41,w_CHANNEL, 0xF100,0xFFFF);
+	LCD_Draw_Word(65,230,41,w_CHANNEL, 0xF100,0xFFFF);
+
+	LCD_Set_Draw_Range(75,0,76,319);
+
+	for(i=0; i<320 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(90,230,23,w_MODE,0x0000,0xFFFF);
+	LCD_Draw_Word(90,70,23,w_MODE,0x0000,0xFFFF);
+	LCD_Draw_Word(90,305,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(90,140,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(90,170,8,w_plus,0x0000,0xFFFF);
+	LCD_Draw_Word(90,10,8,w_plus,0x0000,0xFFFF);
+
+
+	LCD_Set_Draw_Range(116,0,117,319);
+
+	for(i=0; i<320 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(131,230,23,w_TYPE,0x0000,0xFFFF);
+	LCD_Draw_Word(131,70,23,w_TYPE,0x0000,0xFFFF);
+	LCD_Draw_Word(131,305,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(131,140,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(131,170,8,w_plus,0x0000,0xFFFF);
+	LCD_Draw_Word(131,10,8,w_plus,0x0000,0xFFFF);
+
+
+	LCD_Set_Draw_Range(157,0,158,319);
+
+	for(i=0; i<320 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(173,217,53,w_THRESHOLD,0x0000,0xFFFF);
+	LCD_Draw_Word(173,53,53,w_THRESHOLD,0x0000,0xFFFF);
+	LCD_Draw_Word(173,305,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(173,140,8,w_minus,0x0000,0xFFFF);
+	LCD_Draw_Word(173,170,8,w_plus,0x0000,0xFFFF);
+	LCD_Draw_Word(173,10,8,w_plus,0x0000,0xFFFF);
+
+
+	LCD_Set_Draw_Range(198,0,199,319);
+
+	for(i=0; i<320 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+
+	LCD_Set_Draw_Range(199,79,239,80);
+
+	for(i=0; i<42 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Set_Draw_Range(199,239,239,240);
+
+	for(i=0; i<42 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Draw_Word(214,192,17,w_ARM,0x0000,0xFFFF);
+	LCD_Draw_Word(214,32,17,w_ARM,0x0000,0xFFFF);
+	LCD_Draw_Word(214,106,29,w_FORCE,0x0000,0xFFFF);
+	LCD_Draw_Word(214,266,29,w_FORCE,0x0000,0xFFFF);
+}
+
+/*
+ * Function that draws the buttons on the home screen
+ *
+ */
+void LCD_Draw_Home_Buttons(void) {
+
+	int i,j;
+
+	LCD_Background(0xFFFF);
+
+	LCD_Set_Draw_Range(60,159,239,160);
+
+	for(i=0; i<180 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+	LCD_Set_Draw_Range(149,0,150,319);
+
+	for(i=0; i<320 ;i++) {
+		for(j=0; j<2 ;j++) {
+			LCD_Write_Data(0x0000);
+		}
+	}
+
+
+	LCD_Draw_Word(100,75,41,w_TRIGGER,0x0000, 0xFFFF);
+	LCD_Draw_Word(95,235,35,w_COUPLE,0x0000, 0xFFFF);
+	LCD_Draw_Word(105,238,29,w_RANGE,0x0000, 0xFFFF);
+	LCD_Draw_Word(190,235,41,w_WAVEGEN,0x0000, 0xFFFF);
+	LCD_Draw_Word(190,75,23,w_INFO,0x0000,0xFFFF);
+}
+
+
+/*
+ *
+ * Function that updates Globals from Variable Packet after PC ethernet package
+ *
+ */
+void Update_Globals(void) {
+
+	FGwavetype = VariablesPack1 | 0b111;
+	FGamp = (VariablesPack1| 0b111) >> 3;
+	FGoffset = (VariablesPack1 | 0x07FF) >> 6;
+	FGfrequency = (VariablesPack1 | 0x7FFF) >> 17;
+
+	FEvertRangeA = (VariablesPack2 | 0x0F);
+	FEvertRangeB = (VariablesPack2 | 0x0F) >> 4;
+	FEoffsetA = (VariablesPack2 | 0x07FF) >> 8;
+	FEoffsetB = (VariablesPack2 | 0x07FF) >> 19;
+	FEcoupleA = ((VariablesPack2 | 0x01) >> 30) * 0xFF;
+	FEcoupleA = ((VariablesPack2 | 0x01) >> 31) * 0xFF;
+
+}
+
+/*
+ *
+ * Function that updates Variable Packet from Globals after a touch
+ *
+ */
+void Update_Packet(void) {
+
+	VariablesPack1 = 	(FGwavetype | 0b111) |
+						((FGamp | 0b111) << 3) |
+						((FGoffset | 0x07FF) << 6) |
+						((FGfrequency | 0x7FFF) << 17);
+
+	VariablesPack2 =	((FEvertRangeA | 0x0F)) |
+						((FEvertRangeB | 0x0F) << 4) |
+						((FEoffsetA | 0x07FFF) << 8) |
+						((FEoffsetB | 0x07FFF) << 19) |
+						((FEcoupleA | 0x01) << 30) |
+						((FEcoupleB | 0x01) << 31);
+
+	VariablesPack3 =	(FEhorRange | 0x1F);
+
+
+
+}
+
+
+/*
+ * Function that checks if the touchscreen is currently being touched
+ * @ret: 	1 if it is being touched
+ * 			0 if not
+ *
+ */
+uint8_t TOUCH_Check_For_Touch(void) {
+	if(GPIOPinRead(GPIO_PORTN_BASE, GPIO_PIN_3)) {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+
+/*
+ * Function that writes the data byte to the touchscreen by SPI
+ * @param: 	data = byte to be written to touchscreen
+ *
+ */
+void TOUCH_Write(uint8_t data) {
+
+	uint8_t temp, i;
+
+	temp = data;
+
+	for(i=0; i<8; i++) {
+
+		if(temp & 0x80) {
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_1, 0xFF);		//T_MOSI
+		} else {
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_1, 0);		//T_MOSI
+		}
+
+		temp = temp << 1;
+		//CLK low
+		ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_3, 0);
+		//CLK high
+		ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_3, 0xFF);
+	}
+
+	//Extra Clock Cycle
+	//CLK low
+	ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_3, 0);
+	//CLK high
+	ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_3, 0xFF);
+
+
+
+}
+
+/*
+ * Function that gets the x value of the current touch position
+ * @ret: 	data = value of x position of touch
+ *
+ */
+uint16_t TOUCH_Get_X(void) {
+
+	int i;
+	uint16_t data;
+	int j;
+	int sum = 0;
+
+
+	for(j=0; j<5; j++){
+
+		data = 0;
+		TOUCH_Write(GET_X);
+
+
+		for(i=0; i<12; i++) {
+			data <<= 1;
+
+			//CLK high
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_3, 0xFF);
+			//CLK low
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_3, 0);
+
+			if (GPIOPinRead(GPIO_PORTD_BASE, GPIO_PIN_0)) {
+				data++;
+			}
+		}
+		//Sum each read for more accurate result
+		sum = sum + data;
+
+	}
+
+	//Get average
+	sum = sum / 5;
+
+	return(sum);
+}
+
+/*
+ * Function that gets the y value of the most current touch position
+ * @ret: 	data = value of y position of touch
+ *
+ */
+uint16_t TOUCH_Get_Y(void) {
+
+	int i;
+	uint16_t data;
+	int j;
+	int sum = 0;
+
+	for(j=0; j<5; j++){
+		data = 0;
+		TOUCH_Write(GET_Y);
+
+		for(i=0; i<12; i++) {
+			data <<= 1;
+
+			//CLK high
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_3, 0xFF);
+			//CLK low
+			ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_3, 0);
+
+			if (GPIOPinRead(GPIO_PORTD_BASE, GPIO_PIN_0)) {
+				data++;
+			}
+		}
+		//Sum each read for more accurate result
+		sum = sum + data;
+
+	}
+
+	//Get average
+	sum = sum / 5;
+
+	return(sum);
+}
+
+/*
+ *
+ * Function that handles when the touchscreen registers a touch
+ *
+ */
+void TOUCH_Handle(void) {
+
+	uint16_t xTouch, yTouch;
+
+	//Get Data from touch
+	//Write CS low
+	ROM_GPIOPinWrite(GPIO_PORTN_BASE, GPIO_PIN_2, 0);
+	xTouch = TOUCH_Get_X();
+
+	//Write CS high
+	ROM_GPIOPinWrite(GPIO_PORTN_BASE, GPIO_PIN_2, 0xFF);
+
+	//Write CS low
+	ROM_GPIOPinWrite(GPIO_PORTN_BASE, GPIO_PIN_2, 0);
+	yTouch = TOUCH_Get_Y();
+
+	//Write CS high
+	ROM_GPIOPinWrite(GPIO_PORTN_BASE, GPIO_PIN_2, 0xFF);
+
+	SysCtlDelay(120000000/3/5);
+
+	if(LCDwindow == STANDBY) {
+		LCDwindow = LCDtempWindow;
+		ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_1, 0xFF);
+		xTouch = 0;
+		yTouch = 0;
+	}
+
+
+	if(xTouch > 160 && xTouch < 1070) {
+		if( yTouch > 358 && yTouch < 1050) {
+			LCDwindow = HOME;
+			} else if(yTouch > 3110 && yTouch < 3900) {
+				LCDtempWindow = LCDwindow;
+				LCDwindow = STANDBY;
+			} else {
+				LCDbrightness = ((yTouch- 1050)/412) + 1;
+				LCD_Draw_Toolbar();
+			}
+		xTouch = 0;
+		yTouch = 0;
+	}
+
+	if(LCDwindow == HOME) {
+
+		LCD_Draw_Home_Buttons();
+		if(xTouch > 1070 && xTouch < 2350) {
+			if(yTouch > 358 && yTouch < 2100) {
+				LCDwindow = COUPLE;
+			}
+			if(yTouch > 2100 && yTouch < 3900) {
+
+				LCDwindow = TRIG;
+			}
+		} else if(xTouch > 2350 && xTouch < 3900) {
+			if(yTouch > 358 && yTouch < 2100) {
+				LCDwindow = WAVEGEN;
+			}
+			if(yTouch > 2100 && yTouch < 3900) {
+
+				LCDwindow = INFO;
+			}
+		}
+	}
+
+	if(LCDwindow == TRIG) {
+
+		LCD_Draw_Trig_Screen();
+
+		if(xTouch > 1200 && xTouch < 1900) {
+			if(yTouch > 400 && yTouch < 1300) {
+				// A MODE -
+				UARTprintf("- MODE A\n");
+				SAmode--;
+			} else if(yTouch > 1400 && yTouch < 2050) {
+				//+ MODE A
+				UARTprintf("+ MODE A\n");
+				SAmode++;
+			} else if(yTouch > 2150 && yTouch < 2850) {
+				//- MODE B
+				UARTprintf("- MODE B\n");
+
+			} else if(yTouch > 2950 && yTouch < 3700) {
+				//+ MODE B
+				UARTprintf("+ MODE B\n");
+
+			}
+
+		} else if(xTouch > 2000 && xTouch < 2400) {
+			if(yTouch > 400 && yTouch < 1300) {
+				// A TYPE -
+				UARTprintf("- TYPE A\n");
+				SAtype--;
+
+			} else if(yTouch > 1400 && yTouch < 2050) {
+				//+ TYPE A
+				UARTprintf("+ TYPE A\n");
+				SAtype++;
+
+			} else if(yTouch > 2150 && yTouch < 2850) {
+				//- TYPE B
+				UARTprintf("- TYPE B\n");
+
+			} else if(yTouch > 2950 && yTouch < 3700) {
+				//+ TYPE B
+				UARTprintf("+ TYPE B\n");
+
+			}
+
+		} else if(xTouch > 2450 && xTouch < 2900) {
+			if(yTouch > 400 && yTouch < 1300) {
+				// A THRESHOLD -
+				UARTprintf("- THRESHOLD A\n");
+				SAthreshold--;
+			} else if(yTouch > 1400 && yTouch < 2050) {
+				//+ THRESHOLD A
+				UARTprintf("+ THRESHOLD A\n");
+				SAthreshold++;
+
+			} else if(yTouch > 2150 && yTouch < 2850) {
+				//- THRESHOLD B
+				UARTprintf("- THRESHOLD B\n");
+
+			} else if(yTouch > 2950 && yTouch < 3700) {
+				//+ THRESHOLD B
+				UARTprintf("+ THRESHOLD B\n");
+
+			}
+
+		} else if(xTouch > 2950 && xTouch < 3600) {
+			if(yTouch > 400 && yTouch < 1300) {
+				// A FORCE
+				UARTprintf("A FORCE\n");
+
+			} else if(yTouch > 1400 && yTouch < 2050) {
+				// A ARM
+				UARTprintf("A ARM\n");
+
+			} else if(yTouch > 2150 && yTouch < 2850) {
+				// B FORCE
+				UARTprintf("B FORCE\n");
+
+			} else if(yTouch > 2950 && yTouch < 3700) {
+				// B ARM
+				UARTprintf("B ARM\n");
+
+			}
+		}
+
+	}
+
+	if(LCDwindow == COUPLE) {
+
+		LCD_Draw_Couple_Screen();
+		if(xTouch > 1575 && xTouch < 1796) {
+			if(yTouch > 1111 && yTouch < 1568) {
+				//+ RANGE A Vert
+				UARTprintf("+ RANGE A Vert\n");
+				FEvertRangeA++;
+				if(FEvertRangeA > 6) {
+					FEvertRangeA = 0;
+				}
+				FE_Set_Amp_A(FEvertRangeA);
+
+			} else if(yTouch > 2750 && yTouch < 3111) {
+				//+ Range B Vert
+				UARTprintf("+ RANGE B Vert\n");
+				FEvertRangeB++;
+				if(FEvertRangeB > 6) {
+					FEvertRangeB = 6;
+				}
+				FE_Set_Amp_B(FEvertRangeB);
+			}
+
+		} else if(xTouch > 1796 && xTouch < 2318) {
+			if(yTouch > 697 && yTouch < 1111) {
+				// - RANGE A Hor
+				UARTprintf("- RANGE A Hor\n");
+				FEhorRange--;
+				if(FEhorRange > 6) {
+					FEhorRange = 15;
+				}
+
+			} else if(yTouch > 1568 && yTouch < 1881) {
+				// + RANGE A Hor
+				UARTprintf("+ RANGE A Hor\n");
+				FEhorRange++;
+				if(FEhorRange > 15) {
+					FEhorRange = 0;
+				}
+			} else if(yTouch > 2300 && yTouch < 2750) {
+				// - RANGE B Hor
+				UARTprintf("- RANGE B Hor\n");
+
+
+			} else if(yTouch > 3111 && yTouch < 3521) {
+				// + RANGE B Hor
+				UARTprintf("+ RANGE B Hor\n");
+
+			}
+
+		} else if(xTouch > 2318 && xTouch < 2748) {
+			if(yTouch > 1111 && yTouch < 1568) {
+				// - RANGE A Vert
+				UARTprintf("- RANGE A Vert\n");
+				FEvertRangeA--;
+				if(FEvertRangeA > 6) {
+					FEvertRangeA = 6;
+				}
+				FE_Set_Amp_A(FEvertRangeA);
+
+			} else if(yTouch > 2750 && yTouch < 3111) {
+				// - RANGE B Vert
+				UARTprintf("- RANGE B Vert\n");
+				FEvertRangeB--;
+				if(FEvertRangeB > 6) {
+					FEvertRangeB = 6;
+				}
+				FE_Set_Amp_B(FEvertRangeB);
+
+			}
+
+		} else if(xTouch > 3000) {
+			if(yTouch > 455 && yTouch < 2150) {
+				// Couple A
+				UARTprintf("COUPLE A\n");
+				FEcoupleA = !FEcoupleA;
+			} else if(yTouch > 2150 && yTouch < 3700) {
+				// Couple B
+				UARTprintf("COUPLE B\n");
+				FEcoupleB = !FEcoupleB;
+			}
+
+			FE_Set_Coupling(FEcoupleA, FEcoupleB);
+		}
+	}
+
+	if(LCDwindow == WAVEGEN) {
+
+		LCD_Draw_Wavegen_Screen();
+
+		if(yTouch > 425 && yTouch < 1200) {
+			UARTprintf("WaveGen ON/OFF\n");
+
+		} else if(yTouch > 1450 && yTouch < 2200) {
+			if(xTouch > 1150 && yTouch < 1650) {
+				// - FREQ
+				UARTprintf("- FREQ\n");
+				FGfrequency--;
+				FG_Set_Frequency(FGfrequency);
+
+			} else if(xTouch > 1750 && xTouch < 2250) {
+				// - AMP
+				UARTprintf("- AMP\n");
+				FGamp--;
+				FG_Set_Amp(FGamp);
+
+			} else if(xTouch > 2350 && xTouch < 2850) {
+				// - WAVETYPE
+				UARTprintf("- WAVETYPE\n");
+				FGwavetype--;
+				if(FGwavetype > 5) {
+					FGwavetype = 5;
+				}
+				FG_Fill_Values(FGwavetype);
+
+			} else if(xTouch > 2850 && xTouch < 3600) {
+				// - OFFSET
+				UARTprintf("- OFFSET\n");
+				FGoffset--;
+				FG_Set_Offset(FGoffset);
+			}
+
+		} else if(yTouch > 2700 && yTouch < 3700) {
+			if(xTouch > 1150 && xTouch < 1650) {
+				// + FREQ
+				UARTprintf("+ FREQ\n");
+				FGfrequency++;
+				FG_Set_Frequency(FGfrequency);
+
+			} else if(xTouch > 1750 && xTouch < 2250) {
+				// + AMP
+				UARTprintf("+ AMP\n");
+				FGamp++;
+				FG_Set_Amp(FGamp);
+
+			} else if(xTouch > 2350 && xTouch < 2850) {
+				// + WAVETYPE
+				UARTprintf("+ WAVETYPE\n");
+				FGwavetype++;
+				if(FGwavetype == 6) {
+					FGwavetype = 0;
+				}
+				FG_Fill_Values(FGwavetype);
+
+			} else if(xTouch > 2850 && xTouch < 3600) {
+				// + OFFSET
+				UARTprintf("+ OFFSET\n");
+				FGoffset++;
+				FG_Set_Offset(FGoffset);
+			}
+
+		}
+
+
+	}
+
+	if(LCDwindow == INFO) {
+
+		LCD_Background(0x001F);
+
+		if(PCconnection) {
+			LCD_Draw_Word(90,200,87,w_IP,0xFFFF,0x07C0);
+		} else {
+			LCD_Draw_Word(90,200,87,w_IP,0xFFFF,0xF100);
+		}
+
+
+		LCD_Draw_Word(110,200,87,w_STATE,0xFFFF,0x001F);
+
+		switch(SAstate) {
+		case 0: //Trig'd
+			LCD_Draw_Word(110,190,87,w_T,0xFFFF,0x001F);
+			break;
+
+		case 1: //Stopped
+			LCD_Draw_Word(110,190,87,w_S,0xFFFF,0x001F);
+			break;
+
+		case 2:	//Armed
+			LCD_Draw_Word(110,190,87,w_A,0xFFFF,0x001F);
+			break;
+		}
+	}
+
+	if(LCDwindow == STANDBY) {
+		// Backlight off
+		ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_1, 0);
+		if(xTouch | yTouch) {
+			ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_1, 0xFF);
+			LCDwindow = LCDtempWindow;
+		}
+	}
+	xTouch = 0;
+	yTouch = 0;
+
+	//Update Variable Packet
+
+
+	//Send PC the Packet
+
+
+}
+
+/*
+ *
+ * Function that sets initial values for system variables and sets hardware accordingly
+ *
+ */
+void Initial_Variable_Set(void) {
+
+	//System Variables
+	PCconnection = 0;
+
+	//Function Generator Variables
+	FGcount = 0;
+	FGwavetype = SINE;
+	FGfrequency = 250;
+	FGoffset = 0b01000000000;
+	FGamp = 0;
+
+	// LCD Variables
+	LCDbrightness = 5;
+	LCDwindow = HOME;
+	PWM_count = 0;
+
+	// Front End Variables
+	FEvertRangeA = 4;
+	FEvertRangeB = 4;
+	FEhorRange = 0;
+	FEoffsetA = 0b01000000000;
+	FEoffsetB = 0b01000000000;
+	FEcoupleA = 0;
+	FEcoupleB = 0;
+
+
+	// Signal Acquisition Variables
+	SAtype = 0;
+	SAthreshold = 2048;
+	SAmode = 0;
+
+	// Set Function Generator Hardware
+	FG_Fill_Values(FGwavetype);
+	FG_Set_Frequency(FGfrequency);
+	FG_Set_Offset(FGoffset);
+	FG_Set_Amp(FGamp);
+
+	// Set LCD Up
+	LCD_Init();
+	LCD_Clear();
+	LCD_Background(0xFFFF);
+	LCD_Draw_Toolbar();
+	LCD_Draw_Home_Buttons();
+
+	// Set Front End Hardware
+	FE_Set_Amp_A(FEvertRangeA);
+	FE_Set_Amp_B(FEvertRangeB);
+	FE_Set_Offset_A(FEoffsetA);
+	FE_Set_Offset_B(FEoffsetB);
+	FE_Set_Coupling(FEcoupleA, FEcoupleB);
+
+	// Set Signal Acquisition System
+
+}
+
+/*
+ * Function that initialises the hardware on the tivaboard such as;
+ * 		the GPIO pins, clock etc.
+ */
+void Hardware_Init(void) {
+
+    // Set the clocking to run directly from the crystal at 120MHz.
+    g_ui32SysClock = MAP_SysCtlClockFreqSet((SYSCTL_XTAL_25MHZ |
+                                             SYSCTL_OSC_MAIN |
+                                             SYSCTL_USE_PLL |
+                                             SYSCTL_CFG_VCO_480), 120000000);
+
+    // Enable the GPIO ports for communication with LCD.
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOC);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOH);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOK);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOM);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPION);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOD);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOG);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOL);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOE);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOP);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOQ);
+
+
+
+    // Enable the GPIO pins as outputs.
+
+    //LCD Control pins
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTG_BASE, GPIO_PIN_1); 	//LED
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTH_BASE, GPIO_PIN_3); 	//CS
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_3);		//WR
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTG_BASE, GPIO_PIN_0); 	//RD
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_2);		//RS
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTH_BASE, GPIO_PIN_2);		//RST
+
+    //LCD Data pins
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTM_BASE, GPIO_PIN_0); 	//DB0
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTM_BASE, GPIO_PIN_1);		//DB1
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTM_BASE, GPIO_PIN_2);		//DB2
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTM_BASE, GPIO_PIN_3); 	//DB3
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTM_BASE, GPIO_PIN_4); 	//DB4
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTM_BASE, GPIO_PIN_5);		//DB5
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTM_BASE, GPIO_PIN_6);		//DB6
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTM_BASE, GPIO_PIN_7); 	//DB7
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTK_BASE, GPIO_PIN_0); 	//DB8
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTK_BASE, GPIO_PIN_1);		//DB9
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTK_BASE, GPIO_PIN_2);		//DB10
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTK_BASE, GPIO_PIN_3); 	//DB11
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTK_BASE, GPIO_PIN_4); 	//DB12
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTK_BASE, GPIO_PIN_5);		//DB13
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTK_BASE, GPIO_PIN_6);		//DB14
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTK_BASE, GPIO_PIN_7); 	//DB15
+
+    //SPI for touchscreen
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTD_BASE, GPIO_PIN_1); 	//T_MOSI
+    ROM_GPIOPinTypeGPIOInput(GPIO_PORTD_BASE, GPIO_PIN_0); 		//T_MISO
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTN_BASE, GPIO_PIN_2); 	//T_CS
+    ROM_GPIOPinTypeGPIOInput(GPIO_PORTN_BASE, GPIO_PIN_3); 		//T_IRQ
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTD_BASE, GPIO_PIN_3); 	//T_CLK
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTL_BASE, 0x3F); 			//DAC D0-D5
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTE_BASE, 0x33); 			//DAC D6-D9
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_2); 	//DAC1 CS
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTC_BASE, GPIO_PIN_7); 	//DAC2 CS
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTD_BASE, GPIO_PIN_7); 	//DAC3 CS
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_6); 	//DAC4 CS
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_3); 	//DAC WR
+
+    //dMUX data pins
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTD_BASE, GPIO_PIN_2); 	//S0
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTP_BASE, GPIO_PIN_0); 	//S1
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTP_BASE, GPIO_PIN_1); 	//S2
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_0); 	//dMUX1 en
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTD_BASE, GPIO_PIN_4); 	//dMUX2 en
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_1); 	//dMUX3 en
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTD_BASE, GPIO_PIN_5); 	//COUPLE A
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTQ_BASE, GPIO_PIN_0); 	//COUPLE B
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTP_BASE, GPIO_PIN_4); 	//BP Relay
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTN_BASE, GPIO_PIN_5); 	//+/- Relay
+
+
+    //Initial Values for Sensitive pins
+	ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_1, 0xFF);		//T_MOSI
+	ROM_GPIOPinWrite(GPIO_PORTN_BASE, GPIO_PIN_2, 0xFF);		//T_CS
+	ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_3, 0xFF);		//T_CLK
+
+	ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_2, 0xFF);		//DAC CS1
+	ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3, 0xFF);		//DAC WR
+
+	ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_0, 0xFF);		//dMUX1 en
+	ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_4, 0xFF);		//dMUX2 en
+	ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_1, 0xFF);		//dMUX3 en
+	ROM_GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_5, 0);			//COUPLE A
+	ROM_GPIOPinWrite(GPIO_PORTQ_BASE, GPIO_PIN_0, 0);			//COUPLE B
+	ROM_GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_4, 0);			//BP Relay
+	ROM_GPIOPinWrite(GPIO_PORTN_BASE, GPIO_PIN_5, 0);			//+/- Relay
+
+
+
+    // Initialise Random number Generator
+    srand((unsigned) FGcount);
+
+    // Enable the timer.
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
+
+    // Configure the 32-bit periodic timer.
+    ROM_TimerConfigure(TIMER0_BASE, TIMER_CFG_PERIODIC);
+
+    // Register the timer routine.
+    TimerIntRegister(TIMER0_BASE, TIMER_A, Timer0IntHandler);
+
+    // Enable the timer.
+    ROM_TimerEnable(TIMER0_BASE, TIMER_A);
+
+    // Setup the interrupts for the timer timeout.
+    ROM_IntEnable(INT_TIMER0A);
+    ROM_TimerIntEnable(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
+
+    // Enable the GPIO Peripheral used by the UART.
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+
+    // Enable UART0
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
+
+    // Configure GPIO Pins for UART mode.
+    ROM_GPIOPinConfigure(GPIO_PA0_U0RX);
+    ROM_GPIOPinConfigure(GPIO_PA1_U0TX);
+    ROM_GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
+
+    // Initialize the UART for console I/O.
+    UARTStdioConfig(0, 115200, g_ui32SysClock);
+
+
+
+}
+
+/*
+ * Main loop of the program
+ *
+ */
+int main(void) {
+
+	Hardware_Init();
+
+	Initial_Variable_Set();
+
+
+	// LED On
+	ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_1, 0xFF);
+
+	while(1) {
+
+		//check for touch
+		if(TOUCH_Check_For_Touch()) {
+			TOUCH_Handle();
+		}
+	}
+}
